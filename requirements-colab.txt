@@ -1,0 +1,15 @@
+# GPU stack for a Colab T4 (15 GB). Install with:
+#   pip install -r requirements-colab.txt
+# Unsloth pulls a compatible torch/transformers set; do not pin torch here.
+unsloth
+transformers
+datasets
+trl
+accelerate
+bitsandbytes
+peft
+protobuf
+sentencepiece
+huggingface_hub
+pyyaml
+pydantic>=2.0

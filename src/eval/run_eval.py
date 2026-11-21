@@ -1,0 +1,197 @@
+"""Zero-shot and LoRA benchmark runner.
+
+Loads one 4-bit model at a time, scores ``data/golden_eval.jsonl``, then frees
+VRAM before the next model. CPU machines can still import the scoring helpers;
+generation itself requires a CUDA GPU and Unsloth.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+from src.adapters import adapter_for, load_model_registry
+from src.adapters.base import ModelSpec
+from src.eval.report import percentile, render_report, score_case
+from src.spec.prompt_builder import prompt_from_case
+from src.spec.tools_schema import get_scoped_tools
+from src.spec.validator import validate_tool_call
+
+
+def load_cases(path: str | Path) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped:
+            cases.append(json.loads(stripped))
+    return cases
+
+
+def evaluate_prediction(case: dict[str, Any], tool_name: str | None, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    if tool_name is None or arguments is None:
+        scored = score_case(case, None, None, valid=False)
+        return {**scored, "reason": "unparsed"}
+    result = validate_tool_call(
+        tool_name,
+        arguments,
+        combined_text=str(case.get("user_text") or ""),
+        snapshot=case.get("snapshot") or {},
+    )
+    scored = score_case(case, tool_name, result.arguments if result.ok else arguments, valid=result.ok)
+    reason = "ok" if scored["tool_ok"] and scored["args_ok"] else _reason(scored, result.issues)
+    return {**scored, "reason": reason}
+
+
+def _reason(scored: dict[str, Any], issues: list[Any]) -> str:
+    if not scored["valid"]:
+        detail = "; ".join(issue.message for issue in issues) or "schema"
+        return f"invalid: {detail}"
+    if not scored["tool_ok"]:
+        return "wrong tool"
+    if not scored["args_ok"]:
+        return "argument mismatch"
+    return "ok"
+
+
+def summarize(model: str, details: list[dict[str, Any]], latencies: list[float], peak_vram_gb: float | None) -> dict[str, Any]:
+    count = max(1, len(details))
+    injection = [item["injection_defended"] for item in details if item["injection_defended"] is not None]
+    failures = [
+        {"id": item["id"], "reason": item["reason"]}
+        for item in details
+        if item["reason"] != "ok"
+    ]
+    return {
+        "model": model,
+        "json_schema_validity": 100.0 * sum(1 for item in details if item["valid"]) / count,
+        "tool_selection_accuracy": 100.0 * sum(1 for item in details if item["tool_ok"]) / count,
+        "critical_argument_exact_match": 100.0 * sum(1 for item in details if item["args_ok"]) / count,
+        "prompt_injection_defense": None if not injection else 100.0 * sum(1 for item in injection if item) / len(injection),
+        "p50_latency_s": percentile(latencies, 0.50),
+        "p95_latency_s": percentile(latencies, 0.95),
+        "peak_vram_gb": peak_vram_gb,
+        "failures": failures,
+    }
+
+
+def build_eval_prompt(case: dict[str, Any], spec: ModelSpec) -> str:
+    built = prompt_from_case(case)
+    tools = get_scoped_tools(str(case.get("user_text") or ""))
+    adapter = adapter_for(spec)
+    messages = [
+        {"role": "system", "content": built.system},
+        {"role": "user", "content": built.user},
+    ]
+    return adapter.format_messages(messages, tools)
+
+
+def run_models(
+    model_keys: list[str],
+    cases: list[dict[str, Any]],
+    *,
+    registry_path: str | Path = "configs/models.yaml",
+    lora_path: str | None = None,
+) -> list[dict[str, Any]]:
+    defaults, registry = load_model_registry(registry_path)
+    rows: list[dict[str, Any]] = []
+    for key in model_keys:
+        if key not in registry:
+            raise SystemExit(f"Unknown model {key}. Known: {', '.join(registry)}")
+        spec = registry[key]
+        details, latencies, peak = _generate_one(spec, cases, defaults.max_new_tokens, defaults.temperature, lora_path)
+        rows.append(summarize(key if not lora_path else f"{key}+lora", details, latencies, peak))
+    return rows
+
+
+def _generate_one(
+    spec: ModelSpec,
+    cases: list[dict[str, Any]],
+    max_new_tokens: int,
+    temperature: float,
+    lora_path: str | None,
+) -> tuple[list[dict[str, Any]], list[float], float | None]:
+    import torch
+    from unsloth import FastLanguageModel
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=spec.repo_id,
+        max_seq_length=spec.max_seq_length,
+        load_in_4bit=spec.load_in_4bit,
+        dtype=None,
+    )
+    if lora_path:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, lora_path)
+    FastLanguageModel.for_inference(model)
+    adapter = adapter_for(spec, tokenizer)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    details: list[dict[str, Any]] = []
+    latencies: list[float] = []
+    try:
+        for case in cases:
+            tools = get_scoped_tools(str(case.get("user_text") or ""))
+            built = prompt_from_case(case)
+            messages = [
+                {"role": "system", "content": built.system},
+                {"role": "user", "content": built.user},
+            ]
+            prompt = adapter.format_messages(messages, tools)
+            inputs = tokenizer(prompt, return_tensors="pt")
+            if torch.cuda.is_available():
+                inputs = {key: value.to(model.device) for key, value in inputs.items()}
+            started = time.perf_counter()
+            with torch.inference_mode():
+                output = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=temperature > 0,
+                    temperature=temperature if temperature > 0 else None,
+                    use_cache=True,
+                )
+            elapsed = time.perf_counter() - started
+            latencies.append(elapsed)
+            generated = tokenizer.decode(output[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=False)
+            parsed = adapter.parse_tool_call(generated)
+            scored = evaluate_prediction(
+                case,
+                None if parsed is None else parsed.name,
+                None if parsed is None else parsed.arguments,
+            )
+            details.append({"id": case.get("id"), **scored})
+    finally:
+        peak = None
+        if torch.cuda.is_available():
+            peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        del model, tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return details, latencies, peak
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Benchmark Qwen and Gemma on the golden Vietnamese set.")
+    parser.add_argument("--models", nargs="+", required=True)
+    parser.add_argument("--lora-path", default=None)
+    parser.add_argument("--golden", default="data/golden_eval.jsonl")
+    parser.add_argument("--registry", default="configs/models.yaml")
+    parser.add_argument("--output", default="results/benchmark_report.md")
+    args = parser.parse_args(argv)
+    cases = load_cases(args.golden)
+    rows = run_models(args.models, cases, registry_path=args.registry, lora_path=args.lora_path)
+    report = render_report(rows)
+    destination = Path(args.output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(report, encoding="utf-8")
+    print(report)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

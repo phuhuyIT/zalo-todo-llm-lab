@@ -1,0 +1,3 @@
+"""Zalo Smart Todo offline LLM lab."""
+
+__version__ = "0.1.0"

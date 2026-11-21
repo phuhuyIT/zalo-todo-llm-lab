@@ -1,0 +1,32 @@
+# Unsloth QLoRA settings that stay inside 15 GB on a Colab T4.
+model: qwen2.5-7b
+max_seq_length: 3072
+load_in_4bit: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+use_gradient_checkpointing: unsloth
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+num_train_epochs: 3
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+optim: adamw_8bit
+weight_decay: 0.01
+logging_steps: 10
+save_steps: 100
+seed: 42
+train_path: data/train_valid.jsonl
+val_path: data/val_valid.jsonl
+output_dir: outputs/qlora
+# Loss is computed only on the assistant tool-call span.
+train_on_responses_only: true

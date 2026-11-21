@@ -1,0 +1,1 @@
+"""Synthetic teacher-data generation."""

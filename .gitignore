@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+results/
+data/raw_synthetic.jsonl
+data/train_valid.jsonl
+data/val_valid.jsonl
+*.gguf
+*.bin
+*.safetensors
+wandb/
+outputs/

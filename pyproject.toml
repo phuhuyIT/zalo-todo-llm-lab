@@ -1,0 +1,9 @@
+[project]
+name = "zalo-todo-llm-lab"
+version = "0.1.0"
+description = "CPU-local spec parity and Colab QLoRA lab for the Zalo Smart Todo Phase 2 router."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
