@@ -78,6 +78,30 @@ def summarize(model: str, details: list[dict[str, Any]], latencies: list[float],
     }
 
 
+# Training stays at 3072 so a 14B QLoRA run fits a T4. Eval needs room for the
+# fenced calendar prompt plus the completion, which already exceeds 3072 tokens.
+EVAL_CONTEXT = 4096
+
+
+def context_for_eval(configured: int) -> int:
+    return max(configured, EVAL_CONTEXT)
+
+
+def max_prompt_tokens(context: int, max_new_tokens: int) -> int:
+    return max(1, context - max_new_tokens)
+
+
+def clip_token_rows(rows: dict[str, list[int]], max_input: int) -> tuple[dict[str, list[int]], bool]:
+    """Keep the tail of an over-long prompt so the user turn stays inside the context."""
+    length = len(rows.get("input_ids") or [])
+    if length <= max_input:
+        return rows, False
+    clipped = {key: values[-max_input:] for key, values in rows.items()}
+    if "attention_mask" in clipped:
+        clipped["attention_mask"] = [1] * len(clipped["input_ids"])
+    return clipped, True
+
+
 def build_eval_prompt(case: dict[str, Any], spec: ModelSpec) -> str:
     built = prompt_from_case(case)
     tools = get_scoped_tools(str(case.get("user_text") or ""))
@@ -117,9 +141,11 @@ def _generate_one(
     import torch
     from unsloth import FastLanguageModel
 
+    context = context_for_eval(spec.max_seq_length)
+    prompt_budget = max_prompt_tokens(context, max_new_tokens)
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=spec.repo_id,
-        max_seq_length=spec.max_seq_length,
+        max_seq_length=context,
         load_in_4bit=spec.load_in_4bit,
         dtype=None,
     )
@@ -128,6 +154,9 @@ def _generate_one(
 
         model = PeftModel.from_pretrained(model, lora_path)
     FastLanguageModel.for_inference(model)
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.max_length = context
+        model.generation_config.max_new_tokens = max_new_tokens
     adapter = adapter_for(spec, tokenizer)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -142,28 +171,52 @@ def _generate_one(
                 {"role": "user", "content": built.user},
             ]
             prompt = adapter.format_messages(messages, tools)
-            inputs = tokenizer(prompt, return_tensors="pt")
-            if torch.cuda.is_available():
-                inputs = {key: value.to(model.device) for key, value in inputs.items()}
-            started = time.perf_counter()
-            with torch.inference_mode():
-                output = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=temperature > 0,
-                    temperature=temperature if temperature > 0 else None,
-                    use_cache=True,
+            try:
+                encoded = tokenizer(prompt, add_special_tokens=False)
+                rows = {}
+                for key, value in encoded.items():
+                    if hasattr(value, "tolist"):
+                        value = value.tolist()
+                    if isinstance(value, list):
+                        rows[key] = value
+                rows, clipped = clip_token_rows(rows, prompt_budget)
+                if clipped:
+                    print(f"{case.get('id')}: prompt exceeded {prompt_budget} tokens and was clipped from the left")
+                inputs = {key: torch.tensor([values], dtype=torch.long) for key, values in rows.items()}
+                if torch.cuda.is_available():
+                    inputs = {key: value.to(model.device) for key, value in inputs.items()}
+                started = time.perf_counter()
+                generate_kwargs: dict[str, Any] = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": temperature > 0,
+                    "use_cache": True,
+                }
+                if temperature > 0:
+                    generate_kwargs["temperature"] = temperature
+                with torch.inference_mode():
+                    output = model.generate(**inputs, **generate_kwargs)
+                elapsed = time.perf_counter() - started
+                latencies.append(elapsed)
+                generated = tokenizer.decode(output[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=False)
+                parsed = adapter.parse_tool_call(generated)
+                scored = evaluate_prediction(
+                    case,
+                    None if parsed is None else parsed.name,
+                    None if parsed is None else parsed.arguments,
                 )
-            elapsed = time.perf_counter() - started
-            latencies.append(elapsed)
-            generated = tokenizer.decode(output[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=False)
-            parsed = adapter.parse_tool_call(generated)
-            scored = evaluate_prediction(
-                case,
-                None if parsed is None else parsed.name,
-                None if parsed is None else parsed.arguments,
-            )
-            details.append({"id": case.get("id"), **scored})
+                details.append({"id": case.get("id"), **scored})
+            except Exception as exc:
+                latencies.append(0.0)
+                defended = False if case.get("category") == "prompt_injection" else None
+                details.append({
+                    "id": case.get("id"),
+                    "valid": False,
+                    "tool_ok": False,
+                    "args_ok": False,
+                    "injection_defended": defended,
+                    "reason": f"generate failed: {exc}",
+                })
+                print(f"{case.get('id')}: generate failed: {exc}")
     finally:
         peak = None
         if torch.cuda.is_available():

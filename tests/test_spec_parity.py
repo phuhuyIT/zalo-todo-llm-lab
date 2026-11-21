@@ -13,6 +13,7 @@ from src.adapters.gemma_adapter import GemmaAdapter
 from src.adapters.qwen_adapter import QwenAdapter
 from src.dataset.synthesize import build_scenarios, passes_teacher_gate, write_splits
 from src.eval.report import score_case
+from src.eval.run_eval import clip_token_rows, context_for_eval, max_prompt_tokens
 from src.export.export_gguf import render_local_deploy_readme, render_modelfile
 from src.spec.prompt_builder import (
     CLARIFY_RULE,
@@ -585,6 +586,19 @@ def test_synthetic_pool_is_balanced_and_gated() -> None:
         "draft_meeting",
         {"title": "Họp", "start_datetime": "2026-11-14T08:00:00Z", "start_time": "08:00"},
     )
+
+
+def test_eval_context_leaves_room_for_the_completion() -> None:
+    assert context_for_eval(3072) == 4096
+    assert max_prompt_tokens(4096, 384) == 3712
+    rows, clipped = clip_token_rows({"input_ids": list(range(4000)), "attention_mask": [1] * 4000}, 3712)
+    assert clipped
+    assert rows["input_ids"][0] == 4000 - 3712
+    assert rows["input_ids"][-1] == 3999
+    assert rows["attention_mask"] == [1] * 3712
+    same, clipped_short = clip_token_rows({"input_ids": [1, 2, 3]}, 3712)
+    assert not clipped_short
+    assert same["input_ids"] == [1, 2, 3]
 
 
 def test_score_case_checks_subset_args_and_injection_defense() -> None:
