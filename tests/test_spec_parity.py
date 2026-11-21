@@ -485,6 +485,28 @@ def test_qwen_and_gemma_round_trip_tool_calls() -> None:
     assert validate_tool_call(gemma_parsed.name, gemma_parsed.arguments, combined_text="họp", snapshot={}).ok
 
 
+def test_gemma2_template_gets_rules_inside_the_user_turn() -> None:
+    class Gemma2Tokenizer:
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            del tokenize
+            if any(message["role"] == "system" for message in messages):
+                raise RuntimeError("System role not supported")
+            text = "\n".join(message["content"] for message in messages)
+            return text + ("\n<model>" if add_generation_prompt else "")
+
+    rendered = GemmaAdapter(tokenizer=Gemma2Tokenizer()).format_messages(
+        [{"role": "system", "content": "RULES"}, {"role": "user", "content": "hello"}],
+        get_scoped_tools("xin chào"),
+    )
+    assert "RULES" in rendered
+    assert "hello" in rendered
+    assert rendered.endswith("\n<model>")
+    assert "<start_of_turn>system" not in GemmaAdapter().format_messages(
+        [{"role": "system", "content": "RULES"}, {"role": "user", "content": "hello"}],
+        get_scoped_tools("xin chào"),
+    )
+
+
 def BASE_SCHEMAS() -> list[dict]:
     return get_scoped_tools("Kính gửi công văn dài " + ("x" * 240))
 

@@ -16,6 +16,27 @@ _INSTRUCTION = (
 )
 
 
+def fold_system_role(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Gemma 2's chat template rejects a system role. Keep that text on the first user turn."""
+    system_parts = [message["content"] for message in messages if message["role"] == "system"]
+    if not system_parts:
+        return [dict(message) for message in messages]
+    prefix = "\n\n".join(system_parts)
+    folded: list[dict[str, str]] = []
+    placed = False
+    for message in messages:
+        if message["role"] == "system":
+            continue
+        if not placed and message["role"] == "user":
+            folded.append({"role": "user", "content": f"{prefix}\n\n{message['content']}"})
+            placed = True
+        else:
+            folded.append(dict(message))
+    if not placed:
+        folded.insert(0, {"role": "user", "content": prefix})
+    return folded
+
+
 class GemmaAdapter:
     def __init__(self, tokenizer: object | None = None) -> None:
         self.tokenizer = tokenizer
@@ -32,6 +53,8 @@ class GemmaAdapter:
                 prepared.append(dict(message))
         if not injected:
             prepared.insert(0, {"role": "system", "content": spec})
+        # Gemma 2 raises "System role not supported". Gemma 3 accepts a user turn with the same text.
+        prepared = fold_system_role(prepared)
         if self.tokenizer is not None:
             apply = getattr(self.tokenizer, "apply_chat_template", None)
             if apply is None:

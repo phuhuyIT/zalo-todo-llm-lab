@@ -119,6 +119,7 @@ def run_models(
     *,
     registry_path: str | Path = "configs/models.yaml",
     lora_path: str | None = None,
+    output_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     defaults, registry = load_model_registry(registry_path)
     rows: list[dict[str, Any]] = []
@@ -126,9 +127,33 @@ def run_models(
         if key not in registry:
             raise SystemExit(f"Unknown model {key}. Known: {', '.join(registry)}")
         spec = registry[key]
-        details, latencies, peak = _generate_one(spec, cases, defaults.max_new_tokens, defaults.temperature, lora_path)
-        rows.append(summarize(key if not lora_path else f"{key}+lora", details, latencies, peak))
+        label = key if not lora_path else f"{key}+lora"
+        try:
+            details, latencies, peak = _generate_one(spec, cases, defaults.max_new_tokens, defaults.temperature, lora_path)
+            rows.append(summarize(label, details, latencies, peak))
+        except Exception as exc:
+            print(f"{label}: model run failed: {exc}")
+            rows.append(summarize(label, [_failed_case(str(exc))], [], None))
+        if output_path is not None:
+            _write_report(rows, output_path)
     return rows
+
+
+def _failed_case(reason: str) -> dict[str, Any]:
+    return {
+        "id": "model",
+        "valid": False,
+        "tool_ok": False,
+        "args_ok": False,
+        "injection_defended": None,
+        "reason": reason,
+    }
+
+
+def _write_report(rows: list[dict[str, Any]], output_path: str | Path) -> None:
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(render_report(rows), encoding="utf-8")
 
 
 def _generate_one(
@@ -155,7 +180,8 @@ def _generate_one(
         model = PeftModel.from_pretrained(model, lora_path)
     FastLanguageModel.for_inference(model)
     if getattr(model, "generation_config", None) is not None:
-        model.generation_config.max_length = context
+        # Leave max_length unset so transformers does not warn on every sample.
+        model.generation_config.max_length = None
         model.generation_config.max_new_tokens = max_new_tokens
     adapter = adapter_for(spec, tokenizer)
     if torch.cuda.is_available():
@@ -170,8 +196,8 @@ def _generate_one(
                 {"role": "system", "content": built.system},
                 {"role": "user", "content": built.user},
             ]
-            prompt = adapter.format_messages(messages, tools)
             try:
+                prompt = adapter.format_messages(messages, tools)
                 encoded = tokenizer(prompt, add_special_tokens=False)
                 rows = {}
                 for key, value in encoded.items():
@@ -237,13 +263,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", default="results/benchmark_report.md")
     args = parser.parse_args(argv)
     cases = load_cases(args.golden)
-    rows = run_models(args.models, cases, registry_path=args.registry, lora_path=args.lora_path)
-    report = render_report(rows)
-    destination = Path(args.output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(report, encoding="utf-8")
-    print(report)
-    return 0
+    rows = run_models(
+        args.models,
+        cases,
+        registry_path=args.registry,
+        lora_path=args.lora_path,
+        output_path=args.output,
+    )
+    print(Path(args.output).read_text(encoding="utf-8"))
+    return 0 if rows else 1
 
 
 if __name__ == "__main__":
