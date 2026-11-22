@@ -12,8 +12,8 @@ from src.adapters import adapter_for, load_model_registry
 from src.adapters.gemma_adapter import GemmaAdapter
 from src.adapters.qwen_adapter import QwenAdapter
 from src.dataset.synthesize import build_scenarios, passes_teacher_gate, write_splits
-from src.eval.report import score_case
-from src.eval.run_eval import clip_token_rows, context_for_eval, max_prompt_tokens
+from src.eval.report import score_case, select_samples
+from src.eval.run_eval import clip_token_rows, context_for_eval, flatten_token_ids, generation_batch, max_prompt_tokens
 from src.export.export_gguf import render_local_deploy_readme, render_modelfile
 from src.spec.prompt_builder import (
     CLARIFY_RULE,
@@ -608,6 +608,30 @@ def test_synthetic_pool_is_balanced_and_gated() -> None:
         "draft_meeting",
         {"title": "Họp", "start_datetime": "2026-11-14T08:00:00Z", "start_time": "08:00"},
     )
+
+
+def test_gemma3_token_ids_stay_one_dimensional() -> None:
+    class Batched:
+        def tolist(self) -> list[list[int]]:
+            return [[10, 11, 12]]
+
+    assert flatten_token_ids(Batched()) == [10, 11, 12]
+    assert flatten_token_ids([[4, 5]]) == [4, 5]
+    batch = generation_batch([10, 11, 12])
+    assert batch["attention_mask"] == [1, 1, 1]
+    assert len(batch["input_ids"]) == len(batch["attention_mask"])
+
+
+def test_manual_samples_cover_hits_and_misses() -> None:
+    traces = [
+        {"model": "qwen3-8b", "id": "A", "reason": "ok"},
+        {"model": "qwen3-8b", "id": "B", "reason": "argument mismatch"},
+        {"model": "qwen3-8b", "id": "C", "reason": "wrong tool"},
+        {"model": "qwen3-8b", "id": "D", "reason": "invalid: bad date"},
+        {"model": "qwen3-8b", "id": "E", "reason": "argument mismatch"},
+    ]
+    picked = [item["id"] for item in select_samples(traces)]
+    assert picked == ["A", "B", "C", "D"]
 
 
 def test_eval_context_leaves_room_for_the_completion() -> None:

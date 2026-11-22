@@ -31,6 +31,25 @@ def load_cases(path: str | Path) -> list[dict[str, Any]]:
     return cases
 
 
+def _trace(
+    case: dict[str, Any],
+    raw_output: str,
+    tool_name: str | None,
+    arguments: dict[str, Any] | None,
+    scored: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": case.get("id"),
+        "user_text": case.get("user_text"),
+        "expected_tool": case.get("expected_tool"),
+        "expected_args": case.get("expected_args") or {},
+        "raw_output": raw_output,
+        "parsed_tool": tool_name,
+        "parsed_args": arguments or {},
+        **scored,
+    }
+
+
 def evaluate_prediction(case: dict[str, Any], tool_name: str | None, arguments: dict[str, Any] | None) -> dict[str, Any]:
     if tool_name is None or arguments is None:
         scored = score_case(case, None, None, valid=False)
@@ -75,6 +94,7 @@ def summarize(model: str, details: list[dict[str, Any]], latencies: list[float],
         "p95_latency_s": percentile(latencies, 0.95),
         "peak_vram_gb": peak_vram_gb,
         "failures": failures,
+        "traces": list(details),
     }
 
 
@@ -89,6 +109,26 @@ def context_for_eval(configured: int) -> int:
 
 def max_prompt_tokens(context: int, max_new_tokens: int) -> int:
     return max(1, context - max_new_tokens)
+
+
+def flatten_token_ids(value: Any) -> list[int]:
+    """Turn a tokenizer id field into one 1D list.
+
+    Gemma 3 returns an already-batched ``[[...]]`` tensor. Wrapping that again
+    makes a 3D attention mask, which ``generate`` rejects.
+    """
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    while isinstance(value, list) and value and isinstance(value[0], list):
+        value = value[0]
+    if not isinstance(value, list):
+        raise TypeError("tokenizer input_ids are not a list")
+    return [int(item) for item in value]
+
+
+def generation_batch(input_ids: list[int]) -> dict[str, list[int]]:
+    """Prompt tokens plus a 1D mask. The caller adds the batch dimension."""
+    return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids)}
 
 
 def clip_token_rows(rows: dict[str, list[int]], max_input: int) -> tuple[dict[str, list[int]], bool]:
@@ -150,10 +190,21 @@ def _failed_case(reason: str) -> dict[str, Any]:
     }
 
 
+def trace_path_for(output_path: str | Path) -> Path:
+    destination = Path(output_path)
+    return destination.with_name(destination.stem + "_traces.jsonl")
+
+
 def _write_report(rows: list[dict[str, Any]], output_path: str | Path) -> None:
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(render_report(rows), encoding="utf-8")
+    traces: list[dict[str, Any]] = []
+    for row in rows:
+        for trace in row.get("traces") or []:
+            traces.append({"model": row["model"], **trace})
+    payload = "\n".join(json.dumps(trace, ensure_ascii=False) for trace in traces)
+    trace_path_for(destination).write_text(payload + ("\n" if traces else ""), encoding="utf-8")
 
 
 def _generate_one(
@@ -199,16 +250,17 @@ def _generate_one(
             try:
                 prompt = adapter.format_messages(messages, tools)
                 encoded = tokenizer(prompt, add_special_tokens=False)
-                rows = {}
-                for key, value in encoded.items():
-                    if hasattr(value, "tolist"):
-                        value = value.tolist()
-                    if isinstance(value, list):
-                        rows[key] = value
-                rows, clipped = clip_token_rows(rows, prompt_budget)
+                token_ids = flatten_token_ids(encoded["input_ids"])
+                rows, clipped = clip_token_rows({"input_ids": token_ids}, prompt_budget)
                 if clipped:
                     print(f"{case.get('id')}: prompt exceeded {prompt_budget} tokens and was clipped from the left")
-                inputs = {key: torch.tensor([values], dtype=torch.long) for key, values in rows.items()}
+                batch = generation_batch(rows["input_ids"])
+                inputs = {
+                    "input_ids": torch.tensor([batch["input_ids"]], dtype=torch.long),
+                    "attention_mask": torch.tensor([batch["attention_mask"]], dtype=torch.long),
+                }
+                if inputs["attention_mask"].ndim != 2:
+                    raise RuntimeError("attention_mask must be 2D")
                 if torch.cuda.is_available():
                     inputs = {key: value.to(model.device) for key, value in inputs.items()}
                 started = time.perf_counter()
@@ -230,18 +282,18 @@ def _generate_one(
                     None if parsed is None else parsed.name,
                     None if parsed is None else parsed.arguments,
                 )
-                details.append({"id": case.get("id"), **scored})
+                details.append(_trace(case, generated, None if parsed is None else parsed.name, None if parsed is None else parsed.arguments, scored))
             except Exception as exc:
                 latencies.append(0.0)
                 defended = False if case.get("category") == "prompt_injection" else None
-                details.append({
-                    "id": case.get("id"),
+                scored = {
                     "valid": False,
                     "tool_ok": False,
                     "args_ok": False,
                     "injection_defended": defended,
                     "reason": f"generate failed: {exc}",
-                })
+                }
+                details.append(_trace(case, "", None, None, scored))
                 print(f"{case.get('id')}: generate failed: {exc}")
     finally:
         peak = None
