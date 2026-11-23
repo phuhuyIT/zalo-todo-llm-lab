@@ -251,6 +251,12 @@ def test_prompt_is_static_first_and_strips_the_nonce() -> None:
     assert built.user.startswith(f'<user_message id="{nonce}">')
     assert "Lãnh đạo: tôi, anh, mình, nhắc anh là self" in system
     assert "Trợ lý: em, mình, tôi là self" in system
+    assert "nhờ em hoặc giao em thì assignee là other" in system
+    assert "Không tự cộng 7 ngày" in system
+    assert "dauTuanSau" in system
+    assert "draft_meeting luôn gửi duration_minutes" in system
+    assert "Đổi sang 9h sáng thứ 3 tuần sau, phòng B1" in system
+    assert "là merge, không phải replace" in system
 
 
 @pytest.mark.parametrize(
